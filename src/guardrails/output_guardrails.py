@@ -5,7 +5,6 @@ Lab 11 — Part 2B: Output Guardrails
   TODO 8: Output Guardrail Plugin (ADK)
 """
 import re
-import textwrap
 
 from google.genai import types
 from google.adk.agents import llm_agent
@@ -16,37 +15,44 @@ from core.utils import chat_with_agent
 
 
 # ============================================================
-# TODO 6: Implement content_filter()
+# TODO 6: content_filter()
 #
-# Check if the response contains PII (personal info), API keys,
-# passwords, or inappropriate content.
-#
-# Return a dict with:
-# - "safe": True/False
-# - "issues": list of problems found
-# - "redacted": cleaned response (PII replaced with [REDACTED])
+# Why this layer is needed:
+#   The LLM might generate a response that passes input guardrails
+#   but still contains leaked PII, API keys, or internal hostnames.
+#   A regex-based output filter catches deterministic patterns
+#   (e.g., "sk-…" API keys, phone numbers) cheaply and reliably,
+#   redacting them before the user ever sees them.
 # ============================================================
 
 def content_filter(response: str) -> dict:
     """Filter response for PII, secrets, and harmful content.
 
+    Scans the LLM's response for:
+    - API keys (sk-... pattern)
+    - Passwords mentioned inline
+    - Vietnamese phone numbers (010/09-prefix, 10 digits)
+    - Email addresses
+    - National IDs (CMND 9-digit / CCCD 12-digit)
+    - Internal domain references (*.internal)
+
     Args:
         response: The LLM's response text
 
     Returns:
-        dict with 'safe', 'issues', and 'redacted' keys
+        dict with 'safe' (bool), 'issues' (list), and 'redacted' (str)
     """
     issues = []
     redacted = response
 
-    # PII patterns to check
+    # PII patterns to detect and redact
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "API key pattern":           r"sk-[a-zA-Z0-9\-_]{8,}",
+        "Password pattern":          r"password\s*[:=]\s*\S+",
+        "Internal domain":           r"\b\w+\.internal\b",
+        "VN phone number":           r"\b0\d{9,10}\b",
+        "Email":                     r"[\w.\-]+@[\w.\-]+\.[a-zA-Z]{2,}",
+        "National ID (CMND/CCCD)":   r"\b\d{9}\b|\b\d{12}\b",
     }
 
     for name, pattern in PII_PATTERNS.items():
@@ -63,10 +69,14 @@ def content_filter(response: str) -> dict:
 
 
 # ============================================================
-# TODO 7: Implement LLM-as-Judge
+# TODO 7: LLM-as-Judge
 #
-# Create a separate agent (judge) to check response safety.
-# The judge classifies responses as SAFE or UNSAFE.
+# Why this layer is needed:
+#   Regex can only catch patterns it knows about. An LLM judge can
+#   detect semantically unsafe content — e.g., a response that
+#   describes how to perform fraud without using any blocked keyword.
+#   It acts as a second opinion from a model trained to spot harmful
+#   outputs across many dimensions (safety, relevance, accuracy, tone).
 #
 # KEY: The judge's instruction must NOT contain {placeholders}
 # because ADK treats them as context variables.
@@ -89,22 +99,20 @@ Respond with ONLY one word: SAFE or UNSAFE
 If UNSAFE, add a brief reason on the next line.
 """
 
-# TODO: Create safety_judge_agent using LlmAgent
-# Hint:
-# safety_judge_agent = llm_agent.LlmAgent(
-#     model="gemini-2.0-flash",
-#     name="safety_judge",
-#     instruction=SAFETY_JUDGE_INSTRUCTION,
-# )
+# Initialize the judge agent (singleton pattern)
+safety_judge_agent = llm_agent.LlmAgent(
+    model="gemini-2.5-flash-lite",
+    name="safety_judge",
+    instruction=SAFETY_JUDGE_INSTRUCTION,
+)
 
-safety_judge_agent = None  # TODO: Replace with implementation
 judge_runner = None
 
 
 def _init_judge():
-    """Initialize the judge agent and runner (call after creating the agent)."""
+    """Initialize the judge runner (call once after import)."""
     global judge_runner
-    if safety_judge_agent is not None:
+    if safety_judge_agent is not None and judge_runner is None:
         judge_runner = runners.InMemoryRunner(
             agent=safety_judge_agent, app_name="safety_judge"
         )
@@ -112,6 +120,9 @@ def _init_judge():
 
 async def llm_safety_check(response_text: str) -> dict:
     """Use LLM judge to check if response is safe.
+
+    Sends the response to a separate judge agent that classifies it
+    as SAFE or UNSAFE based on its content, not just keyword matches.
 
     Args:
         response_text: The agent's response to evaluate
@@ -129,29 +140,36 @@ async def llm_safety_check(response_text: str) -> dict:
 
 
 # ============================================================
-# TODO 8: Implement OutputGuardrailPlugin
+# TODO 8: OutputGuardrailPlugin
 #
-# This plugin checks the agent's output BEFORE sending to the user.
-# Uses after_model_callback to intercept LLM responses.
-# Combines content_filter() and llm_safety_check().
-#
-# NOTE: after_model_callback uses keyword-only arguments.
-#   - llm_response has a .content attribute (types.Content)
-#   - Return the (possibly modified) llm_response, or None to keep original
+# Why this layer is needed:
+#   Input guardrails stop known attack patterns, but the LLM might
+#   still produce unsafe content in response to a seemingly innocent
+#   query. This plugin intercepts the model's raw output and runs
+#   both cheap (regex) and expensive (LLM judge) checks before the
+#   response is returned to the user, providing defence-in-depth.
 # ============================================================
 
 class OutputGuardrailPlugin(base_plugin.BasePlugin):
-    """Plugin that checks agent output before sending to user."""
+    """ADK plugin that checks and cleans agent output before sending to user.
 
-    def __init__(self, use_llm_judge=True):
+    Pipeline:
+      1. content_filter()   — regex redacts PII / secrets (cheap, deterministic)
+      2. llm_safety_check() — LLM judge validates semantic safety (slow, thorough)
+
+    Returns the (possibly redacted/blocked) llm_response.
+    """
+
+    def __init__(self, use_llm_judge: bool = True):
         super().__init__(name="output_guardrail")
+        # Enable LLM judge only if the judge agent is available
         self.use_llm_judge = use_llm_judge and (safety_judge_agent is not None)
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
 
     def _extract_text(self, llm_response) -> str:
-        """Extract text from LLM response."""
+        """Extract plain text from an LLM response object."""
         text = ""
         if hasattr(llm_response, "content") and llm_response.content:
             for part in llm_response.content.parts:
@@ -165,23 +183,39 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         callback_context,
         llm_response,
     ):
-        """Check LLM response before sending to user."""
+        """Check and possibly modify the LLM response before it reaches the user."""
         self.total_count += 1
 
         response_text = self._extract_text(llm_response)
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        # 1. Regex content filter — redact PII / secrets if found
+        filter_result = content_filter(response_text)
+        if not filter_result["safe"]:
+            self.redacted_count += 1
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=filter_result["redacted"])],
+            )
+            # Use the redacted text for the LLM-judge check below
+            response_text = filter_result["redacted"]
 
-        return llm_response  # TODO: modify if needed
+        # 2. LLM-as-Judge — semantic safety check
+        if self.use_llm_judge:
+            judge_result = await llm_safety_check(response_text)
+            if not judge_result["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(
+                        text="Output blocked: The response failed safety validation. "
+                             "Please rephrase your question."
+                    )],
+                )
+
+        # 3. Return response (possibly modified by steps 1 or 2)
+        return llm_response
 
 
 # ============================================================

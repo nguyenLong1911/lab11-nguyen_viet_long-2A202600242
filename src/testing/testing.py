@@ -16,19 +16,18 @@ from guardrails.output_guardrails import OutputGuardrailPlugin, _init_judge
 # ============================================================
 # TODO 10: Rerun attacks with guardrails
 #
-# Run the same 5 adversarial prompts from TODO 1 against
-# the protected agent (with InputGuardrailPlugin + OutputGuardrailPlugin).
-# Compare results with the unprotected agent.
-#
-# Steps:
-# 1. Create input and output guardrail plugins
-# 2. Create the protected agent with both plugins
-# 3. Run the same attacks from adversarial_prompts
-# 4. Build a comparison table (before vs after)
+# Why this step is important:
+#   The before/after comparison gives a concrete, quantitative
+#   measure of how effective the guardrails are. Each row in the
+#   table represents real risk reduction.
 # ============================================================
 
 async def run_comparison():
     """Run attacks against both unprotected and protected agents.
+
+    Creates an unsafe agent and a protected agent (with input + output
+    guardrails), then runs the same 5 adversarial prompts against both
+    to measure the improvement.
 
     Returns:
         Tuple of (unprotected_results, protected_results)
@@ -40,17 +39,20 @@ async def run_comparison():
     unsafe_agent, unsafe_runner = create_unsafe_agent()
     unprotected_results = await run_attacks(unsafe_agent, unsafe_runner)
 
-    # --- Protected agent ---
-    # TODO 10: Create the protected agent with guardrail plugins
-    # Hint:
-    # input_plugin = InputGuardrailPlugin()
-    # output_plugin = OutputGuardrailPlugin(use_llm_judge=False)
-    # protected_agent, protected_runner = create_protected_agent(
-    #     plugins=[input_plugin, output_plugin]
-    # )
-    # protected_results = await run_attacks(protected_agent, protected_runner)
+    # --- Protected agent (TODO 10) ---
+    print("\n" + "=" * 60)
+    print("PHASE 2: Protected Agent (with guardrails)")
+    print("=" * 60)
 
-    protected_results = []  # TODO: Replace with actual results
+    # Initialise the LLM judge so the output plugin can use it
+    _init_judge()
+
+    input_plugin = InputGuardrailPlugin()
+    output_plugin = OutputGuardrailPlugin(use_llm_judge=False)  # skip judge for speed
+    protected_agent, protected_runner = create_protected_agent(
+        plugins=[input_plugin, output_plugin]
+    )
+    protected_results = await run_attacks(protected_agent, protected_runner)
 
     return unprotected_results, protected_results
 
@@ -80,13 +82,12 @@ def print_comparison(unprotected, protected):
 # ============================================================
 # TODO 11: Automated Security Testing Pipeline
 #
-# Implement the SecurityTestPipeline class that:
-# 1. Runs a batch of attack prompts against the agent
-# 2. Classifies each result (blocked, leaked, error)
-# 3. Calculates security metrics (block rate, leak rate)
-# 4. Generates a formatted report
-#
-# This gives you a reusable framework for testing any agent.
+# Why this pipeline is needed:
+#   Manual testing is slow, inconsistent and doesn't scale.
+#   An automated pipeline lets us run 100+ test cases in one command,
+#   collect structured results, and generate a reproducible report.
+#   It also makes regression testing easy: run it after every change
+#   to your guardrails to check nothing regressed.
 # ============================================================
 
 @dataclass
@@ -102,6 +103,9 @@ class TestResult:
 
 class SecurityTestPipeline:
     """Automated security testing pipeline for AI agents.
+
+    Runs a batch of adversarial prompts, classifies each result,
+    calculates aggregate security metrics, and generates a report.
 
     Usage:
         pipeline = SecurityTestPipeline(agent, runner)
@@ -149,11 +153,12 @@ class SecurityTestPipeline:
                 self.agent, self.runner, attack["input"]
             )
             leaked = self._check_for_leaks(response)
+            # "blocked" means the guardrail stopped any secret leaking
             blocked = len(leaked) == 0
         except Exception as e:
             response = f"Error: {e}"
             leaked = []
-            blocked = True  # Error = not leaked
+            blocked = True  # Exception = request didn't complete = not leaked
 
         return TestResult(
             attack_id=attack["id"],
@@ -176,19 +181,12 @@ class SecurityTestPipeline:
         if attacks is None:
             attacks = adversarial_prompts
 
-        # TODO 11: Implement the pipeline logic
-        # 1. Loop through each attack
-        # 2. Call self.run_single(attack) for each
-        # 3. Collect and return all TestResult objects
-        #
-        # Hint:
-        # results = []
-        # for attack in attacks:
-        #     result = await self.run_single(attack)
-        #     results.append(result)
-        # return results
-
-        return []  # TODO: Replace with implementation
+        # Run each attack sequentially and collect results
+        results = []
+        for attack in attacks:
+            result = await self.run_single(attack)
+            results.append(result)
+        return results
 
     def calculate_metrics(self, results: list) -> dict:
         """Calculate security metrics from test results.
@@ -199,22 +197,25 @@ class SecurityTestPipeline:
         Returns:
             dict with block_rate, leak_rate, total, blocked, leaked counts
         """
-        # TODO 11: Calculate metrics
-        # - total: len(results)
-        # - blocked: count where result.blocked is True
-        # - leaked: count where result.leaked_secrets is non-empty
-        # - block_rate: blocked / total
-        # - leak_rate: leaked / total
-        # - all_secrets_leaked: flat list of all leaked secrets
+        total = len(results)
+        if total == 0:
+            return {
+                "total": 0, "blocked": 0, "leaked": 0,
+                "block_rate": 0.0, "leak_rate": 0.0, "all_secrets_leaked": [],
+            }
+
+        blocked = sum(1 for r in results if r.blocked)
+        leaked = sum(1 for r in results if r.leaked_secrets)
+        all_secrets = [s for r in results for s in r.leaked_secrets]
 
         return {
-            "total": 0,
-            "blocked": 0,
-            "leaked": 0,
-            "block_rate": 0.0,
-            "leak_rate": 0.0,
-            "all_secrets_leaked": [],
-        }  # TODO: Replace with implementation
+            "total": total,
+            "blocked": blocked,
+            "leaked": leaked,
+            "block_rate": blocked / total,
+            "leak_rate": leaked / total,
+            "all_secrets_leaked": all_secrets,
+        }
 
     def print_report(self, results: list):
         """Print a formatted security test report.

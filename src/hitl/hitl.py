@@ -7,17 +7,17 @@ from dataclasses import dataclass
 
 
 # ============================================================
-# TODO 12: Implement ConfidenceRouter
+# TODO 12: ConfidenceRouter
 #
-# Route agent responses based on confidence scores:
-#   - HIGH (>= 0.9): Auto-send to user
-#   - MEDIUM (0.7 - 0.9): Queue for human review
-#   - LOW (< 0.7): Escalate to human immediately
-#
-# Special case: if the action is HIGH_RISK (e.g., money transfer,
-# account deletion), ALWAYS escalate regardless of confidence.
-#
-# Implement the route() method.
+# Why this component is needed:
+#   Not every AI response needs a human reviewer, but some do.
+#   A confidence-based router automates the triage:
+#   - High-confidence, low-risk responses go directly to the user.
+#   - Medium-confidence responses are queued for async human review.
+#   - Low-confidence responses are escalated immediately.
+#   - High-risk actions (money transfers, account deletions) ALWAYS
+#     require a human, regardless of confidence, because the cost
+#     of an error is too high.
 # ============================================================
 
 HIGH_RISK_ACTIONS = [
@@ -42,12 +42,15 @@ class RoutingDecision:
 class ConfidenceRouter:
     """Route agent responses based on confidence and risk level.
 
-    Thresholds:
-        HIGH:   confidence >= 0.9 -> auto-send
-        MEDIUM: 0.7 <= confidence < 0.9 -> queue for review
-        LOW:    confidence < 0.7 -> escalate to human
+    Decision logic:
+      1. High-risk action → always escalate (Human-as-tiebreaker).
+      2. confidence >= 0.9 → auto-send (Human-on-the-loop).
+      3. 0.7 <= confidence < 0.9 → queue for review (Human-in-the-loop).
+      4. confidence < 0.7 → escalate immediately (Human-as-tiebreaker).
 
-    High-risk actions always escalate regardless of confidence.
+    The three thresholds create three HITL models as sliding doors:
+    most traffic auto-sends, edge cases get reviewed, uncertain or
+    risky decisions always land with a human.
     """
 
     HIGH_THRESHOLD = 0.9
@@ -65,71 +68,110 @@ class ConfidenceRouter:
         Returns:
             RoutingDecision with routing action and metadata
         """
-        # TODO 12: Implement routing logic
-        #
-        # 1. Check if action_type is in HIGH_RISK_ACTIONS
-        #    -> If yes: always escalate (action="escalate", priority="high",
-        #       requires_human=True, reason="High-risk action: {action_type}")
-        #
-        # 2. Check confidence thresholds:
-        #    - confidence >= 0.9:
-        #      action="auto_send", priority="low",
-        #      requires_human=False, reason="High confidence"
-        #
-        #    - 0.7 <= confidence < 0.9:
-        #      action="queue_review", priority="normal",
-        #      requires_human=True, reason="Medium confidence — needs review"
-        #
-        #    - confidence < 0.7:
-        #      action="escalate", priority="high",
-        #      requires_human=True, reason="Low confidence — escalating"
+        # 1. High-risk actions always require a human regardless of confidence
+        if action_type in HIGH_RISK_ACTIONS:
+            return RoutingDecision(
+                action="escalate",
+                confidence=confidence,
+                reason=f"High-risk action: {action_type}",
+                priority="high",
+                requires_human=True,
+            )
 
+        # 2. High confidence → auto-send (human monitors after the fact)
+        if confidence >= self.HIGH_THRESHOLD:
+            return RoutingDecision(
+                action="auto_send",
+                confidence=confidence,
+                reason="High confidence",
+                priority="low",
+                requires_human=False,
+            )
+
+        # 3. Medium confidence → queue for async human review
+        if confidence >= self.MEDIUM_THRESHOLD:
+            return RoutingDecision(
+                action="queue_review",
+                confidence=confidence,
+                reason="Medium confidence — needs review",
+                priority="normal",
+                requires_human=True,
+            )
+
+        # 4. Low confidence → escalate immediately
         return RoutingDecision(
-            action="auto_send",
+            action="escalate",
             confidence=confidence,
-            reason="TODO: implement routing logic",
-            priority="low",
-            requires_human=False,
-        )  # TODO: Replace with implementation
+            reason="Low confidence — escalating to human",
+            priority="high",
+            requires_human=True,
+        )
 
 
 # ============================================================
 # TODO 13: Design 3 HITL decision points
 #
-# For each decision point, define:
-# - trigger: What condition activates this HITL check?
-# - hitl_model: Which model? (human-in-the-loop, human-on-the-loop,
-#   human-as-tiebreaker)
-# - context_needed: What info does the human reviewer need?
-# - example: A concrete scenario
-#
-# Think about real banking scenarios where human judgment is critical.
+# Three real banking scenarios where human judgment is critical.
+# Each decision point maps to one of the three HITL models:
+#   - Human-in-the-loop:   agent proposes, human approves before acting
+#   - Human-on-the-loop:   agent acts, human monitors & can override
+#   - Human-as-tiebreaker: agent is uncertain, human makes final call
 # ============================================================
 
 hitl_decision_points = [
     {
         "id": 1,
-        "name": "TODO: Name this decision point",
-        "trigger": "TODO: When does this trigger?",
-        "hitl_model": "TODO: human-in-the-loop / human-on-the-loop / human-as-tiebreaker",
-        "context_needed": "TODO: What does the reviewer need to see?",
-        "example": "TODO: Give a concrete example scenario",
+        "name": "Large Money Transfer Approval",
+        # A transfer above 50 M VND is irreversible and high-value.
+        # The agent can draft the instruction but must not execute it
+        # without a human banker reviewing the transaction details first.
+        "trigger": "Customer requests a transfer > 50,000,000 VND",
+        "hitl_model": "human-in-the-loop",
+        "context_needed": (
+            "Customer transaction history (last 30 days), current account balance, "
+            "KYC verification status, recipient account details, and fraud-risk score."
+        ),
+        "example": (
+            "Customer asks to transfer 200 M VND to an unfamiliar account. "
+            "The agent drafts the transfer request and puts it in a review queue. "
+            "A human banker reviews the risk score and KYC status before approving."
+        ),
     },
     {
         "id": 2,
-        "name": "TODO: Name this decision point",
-        "trigger": "TODO: When does this trigger?",
-        "hitl_model": "TODO: human-in-the-loop / human-on-the-loop / human-as-tiebreaker",
-        "context_needed": "TODO: What does the reviewer need to see?",
-        "example": "TODO: Give a concrete example scenario",
+        "name": "Account Closure Request",
+        # Closing an account is irreversible. Even if the AI is 99% confident
+        # the customer wants to close, a human must confirm — the downside of
+        # a false positive (an account wrongly closed) is too severe.
+        "trigger": "Any intent to permanently close or delete a bank account detected",
+        "hitl_model": "human-as-tiebreaker",
+        "context_needed": (
+            "Outstanding loan balances, remaining account balance, standing orders, "
+            "linked cards, and identity verification confirmation."
+        ),
+        "example": (
+            "Customer says 'I want to close my account'. The AI detects account-closure "
+            "intent and immediately escalates to a senior banker who contacts the customer "
+            "by phone to confirm intent and walk through the closure checklist."
+        ),
     },
     {
         "id": 3,
-        "name": "TODO: Name this decision point",
-        "trigger": "TODO: When does this trigger?",
-        "hitl_model": "TODO: human-in-the-loop / human-on-the-loop / human-as-tiebreaker",
-        "context_needed": "TODO: What does the reviewer need to see?",
-        "example": "TODO: Give a concrete example scenario",
+        "name": "Ambiguous High-Value Loan Application",
+        # The AI can pre-screen a loan application and compute a credit score,
+        # but for loans above 500 M VND the final approval requires a human
+        # credit officer to review edge cases the model may misjudge.
+        "trigger": "Loan amount > 500,000,000 VND OR credit-score confidence < 0.75",
+        "hitl_model": "human-in-the-loop",
+        "context_needed": (
+            "Applicant's credit score, monthly income evidence, total existing debt, "
+            "debt-to-income ratio, collateral details, and employment status."
+        ),
+        "example": (
+            "Customer applies for a 700 M VND business loan. The AI pre-fills the "
+            "application form and adds a risk summary. A credit officer then reviews "
+            "the supporting documents and makes the final approve/reject decision."
+        ),
     },
 ]
 
@@ -143,11 +185,11 @@ def test_confidence_router():
     router = ConfidenceRouter()
 
     test_cases = [
-        ("Balance inquiry", 0.95, "general"),
+        ("Balance inquiry",       0.95, "general"),
         ("Interest rate question", 0.82, "general"),
-        ("Ambiguous request", 0.55, "general"),
-        ("Transfer $50,000", 0.98, "transfer_money"),
-        ("Close my account", 0.91, "close_account"),
+        ("Ambiguous request",      0.55, "general"),
+        ("Transfer $50,000",       0.98, "transfer_money"),
+        ("Close my account",       0.91, "close_account"),
     ]
 
     print("Testing ConfidenceRouter:")
@@ -174,8 +216,8 @@ def test_hitl_points():
         print(f"\n  Decision Point #{point['id']}: {point['name']}")
         print(f"    Trigger:  {point['trigger']}")
         print(f"    Model:    {point['hitl_model']}")
-        print(f"    Context:  {point['context_needed']}")
-        print(f"    Example:  {point['example']}")
+        print(f"    Context:  {point['context_needed'][:100]}...")
+        print(f"    Example:  {point['example'][:100]}...")
     print("\n" + "=" * 60)
 
 
